@@ -1,4 +1,4 @@
-import type { Opportunity, OpportunityAiAnalysis } from "@/lib/types";
+import type { DocumentAiContext, Opportunity, OpportunityAiAnalysis } from "@/lib/types";
 
 export const DEFAULT_OPENAI_ANALYSIS_MODEL = "gpt-4.1-mini";
 
@@ -107,6 +107,191 @@ function parseAnalysis(payload: unknown, fallback: OpportunityAiAnalysis): Oppor
   };
 }
 
+function extractResponsesText(body: Record<string, unknown> | null): string {
+  if (!body) return "";
+  if (typeof body.output_text === "string" && body.output_text.trim()) return body.output_text.trim();
+
+  const pieces: string[] = [];
+  const stack: unknown[] = [];
+  if (Array.isArray(body.output)) stack.push(...body.output);
+
+  while (stack.length) {
+    const item = stack.pop();
+    if (!item || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+
+    if (typeof record.text === "string" && record.text.trim()) {
+      pieces.push(record.text);
+    }
+
+    const content = record.content;
+    if (Array.isArray(content)) stack.push(...content);
+
+    const output = record.output;
+    if (Array.isArray(output)) stack.push(...output);
+  }
+
+  return pieces.join("\n").trim();
+}
+
+function normalizeText(value: string) {
+  return value
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
+
+function findEvidence(text: string, keywords: readonly string[]) {
+  const normalizedKeywords = keywords.map((keyword) => normalizeText(keyword));
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const normalizedLine = normalizeText(trimmed);
+    if (normalizedKeywords.some((keyword) => normalizedLine.includes(keyword))) {
+      return trimmed.slice(0, 240);
+    }
+  }
+  return null;
+}
+
+function uniqueStrings(values: string[]) {
+  return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
+}
+
+const requiredDocumentSignals = [
+  { name: "Carta de presentacion de la propuesta", keywords: ["carta de presentacion", "carta de presentación"] },
+  { name: "Certificado de existencia y representacion legal", keywords: ["certificado de existencia", "representacion legal", "representación legal"] },
+  { name: "RUP vigente y en firme", keywords: ["rup vigente", "rup en firme", "registro unico de proponentes", "registro único de proponentes"] },
+  { name: "RUT", keywords: ["rut"] },
+  { name: "Cedula del representante legal", keywords: ["cedula del representante legal", "cédula del representante legal"] },
+  { name: "Garantia de seriedad de la oferta", keywords: ["garantia de seriedad", "garantía de seriedad"] },
+  { name: "Estados financieros e indicadores habilitantes", keywords: ["estados financieros", "indicadores financieros", "capacidad financiera", "liquidez", "endeudamiento", "capital de trabajo", "patrimonio"] },
+  { name: "Certificaciones de experiencia especifica", keywords: ["experiencia especifica", "experiencia específica", "certificaciones de experiencia", "contratos similares"] },
+  { name: "Hojas de vida y soportes del equipo minimo", keywords: ["hojas de vida", "equipo minimo", "equipo mínimo", "tarjeta profesional", "matricula profesional", "matrícula profesional"] },
+  { name: "Propuesta economica", keywords: ["propuesta economica", "propuesta económica", "oferta economica", "oferta económica"] },
+  { name: "Anexos tecnicos y formatos SECOP", keywords: ["anexos tecnicos", "anexos técnicos", "formatos secop", "formato secop", "anexo tecnico", "anexo técnico"] }
+] as const;
+
+const habilitatingSignalMap = {
+  juridicos: ["capacidad juridica", "capacidad jurídica", "existencia y representacion legal", "existencia y representación legal", "inhabilidades", "incompatibilidades", "rut", "rup"],
+  financieros: ["liquidez", "endeudamiento", "capital de trabajo", "patrimonio", "indicadores financieros", "capacidad financiera"],
+  tecnicos: ["experiencia especifica", "experiencia específica", "contratos similares", "experiencia en obras", "experiencia en consultoria", "experiencia en consultoría", "interventoria", "interventoría"],
+  organizacionales: ["unspsc", "clasificacion", "clasificación", "capacidad residual", "capacidad organizacional", "equipo minimo", "equipo mínimo"]
+} as const;
+
+const teamSignalMap = [
+  { role: "Director de obra", keywords: ["director de obra"] },
+  { role: "Residente de obra", keywords: ["residente de obra"] },
+  { role: "Arquitecto", keywords: ["arquitecto"] },
+  { role: "Ingeniero civil", keywords: ["ingeniero civil"] },
+  { role: "Especialista estructural", keywords: ["estructural"] },
+  { role: "Profesional SST", keywords: ["sst", "seguridad y salud en el trabajo"] },
+  { role: "Interventor", keywords: ["interventor"] }
+] as const;
+
+function enrichDocumentAnalysis(analysis: OpportunityAiAnalysis, documents: DocumentAiContext[]): OpportunityAiAnalysis {
+  const combinedText = documents.map((document) => `${document.name}\n${document.text}`).join("\n\n");
+  if (!combinedText.trim()) return analysis;
+
+  const existingDocuments = new Map<string, OpportunityAiAnalysis["requiredDocuments"][number]>();
+  for (const doc of analysis.requiredDocuments) {
+    existingDocuments.set(normalizeText(doc.name), doc);
+  }
+
+  for (const signal of requiredDocumentSignals) {
+    const evidence = findEvidence(combinedText, signal.keywords);
+    if (!evidence) continue;
+    existingDocuments.set(normalizeText(signal.name), {
+      name: signal.name,
+      status: "requerido",
+      notes: `Encontrado en el pliego: ${evidence}`
+    });
+  }
+
+  const requiredDocuments = Array.from(existingDocuments.values());
+
+  const mergedRequirements = {
+    juridicos: uniqueStrings([
+      ...analysis.habilitatingRequirements.juridicos,
+      ...habilitatingSignalMap.juridicos.flatMap((keyword) => {
+        const evidence = findEvidence(combinedText, [keyword]);
+        return evidence ? [evidence] : [];
+      })
+    ]),
+    financieros: uniqueStrings([
+      ...analysis.habilitatingRequirements.financieros,
+      ...habilitatingSignalMap.financieros.flatMap((keyword) => {
+        const evidence = findEvidence(combinedText, [keyword]);
+        return evidence ? [evidence] : [];
+      })
+    ]),
+    tecnicos: uniqueStrings([
+      ...analysis.habilitatingRequirements.tecnicos,
+      ...habilitatingSignalMap.tecnicos.flatMap((keyword) => {
+        const evidence = findEvidence(combinedText, [keyword]);
+        return evidence ? [evidence] : [];
+      })
+    ]),
+    organizacionales: uniqueStrings([
+      ...analysis.habilitatingRequirements.organizacionales,
+      ...habilitatingSignalMap.organizacionales.flatMap((keyword) => {
+        const evidence = findEvidence(combinedText, [keyword]);
+        return evidence ? [evidence] : [];
+      })
+    ])
+  };
+
+  const textCodes = Array.from(combinedText.matchAll(/\b\d{8}\b/g)).map((match) => match[0]);
+  const unspscIndex = new Map<string, OpportunityAiAnalysis["unspscCodes"][number]>();
+  for (const code of analysis.unspscCodes) unspscIndex.set(normalizeText(code.code), code);
+  for (const code of textCodes) {
+    if (!unspscIndex.has(normalizeText(code))) {
+      unspscIndex.set(normalizeText(code), { code, description: "Codigo detectado en documentos extraidos.", status: "detectado" });
+    }
+  }
+
+  const existingTeamRoles = new Set(analysis.requiredTeam.map((member) => normalizeText(member.role)));
+  const discoveredTeam = teamSignalMap.flatMap((signal) => {
+    const evidence = findEvidence(combinedText, signal.keywords);
+    if (!evidence) return [];
+    existingTeamRoles.add(normalizeText(signal.role));
+    return [{
+      role: signal.role,
+      profession: evidence,
+      experience: `Verificado en el pliego: ${evidence}`,
+      dedication: "Debe verificarse en pliego",
+      documents: ["Hoja de vida", "Diploma", "Tarjeta profesional", "Certificaciones de experiencia"],
+      status: "detectado" as const
+    }];
+  });
+
+  const requiredTeam = [
+    ...discoveredTeam,
+    ...analysis.requiredTeam.filter((member) => !existingTeamRoles.has(normalizeText(member.role)))
+  ];
+
+  const requiredExperience = uniqueStrings([
+    ...analysis.requiredExperience,
+    ...["experiencia especifica", "experiencia específica", "contratos similares", "valor minimo", "valor mínimo", "objeto similar"].flatMap((keyword) => {
+      const evidence = findEvidence(combinedText, [keyword]);
+      return evidence ? [evidence] : [];
+    })
+  ]);
+
+  return {
+    ...analysis,
+    requiredDocuments,
+    habilitatingRequirements: mergedRequirements,
+    unspscCodes: Array.from(unspscIndex.values()),
+    requiredTeam,
+    requiredExperience,
+    limitations: uniqueStrings([
+      ...analysis.limitations,
+      "Analisis enriquecido con texto extraido del pliego y anexos cuando estaba disponible."
+    ])
+  };
+}
+
 export async function analyzeOpportunityWithOpenAI(opportunity: Opportunity, fetchImpl: typeof fetch = fetch): Promise<OpportunityAiAnalysis> {
   const apiKey = process.env.OPENAI_API_KEY;
   const fallback = buildMetadataOnlyAnalysis(opportunity);
@@ -135,7 +320,7 @@ export async function analyzeOpportunityWithOpenAI(opportunity: Opportunity, fet
     throw new Error(error?.message || `OpenAI analysis failed with HTTP ${response.status}.`);
   }
 
-  const outputText = typeof body?.output_text === "string" ? body.output_text : "";
+  const outputText = extractResponsesText(body);
   if (!outputText) return fallback;
 
   try {
@@ -144,8 +329,6 @@ export async function analyzeOpportunityWithOpenAI(opportunity: Opportunity, fet
     return fallback;
   }
 }
-
-import type { DocumentAiContext } from "@/lib/types";
 
 export function buildDocumentAnalysisPrompt(opportunity: Opportunity, documents: DocumentAiContext[]) {
   const documentText = documents
@@ -194,7 +377,7 @@ export async function analyzeOpportunityDocumentsWithOpenAI(
   if (!documents.length) return buildMetadataOnlyAnalysis(opportunity);
   const apiKey = process.env.OPENAI_API_KEY;
   const fallback = buildMetadataOnlyAnalysis(opportunity);
-  if (!apiKey) return { ...fallback, limitations: ["OPENAI_API_KEY no esta configurado.", ...fallback.limitations] };
+  if (!apiKey) return enrichDocumentAnalysis({ ...fallback, limitations: ["OPENAI_API_KEY no esta configurado.", ...fallback.limitations] }, documents);
 
   const model = process.env.OPENAI_ANALYSIS_MODEL || process.env.OPENAI_HEALTH_MODEL || DEFAULT_OPENAI_ANALYSIS_MODEL;
   const response = await fetchImpl("https://api.openai.com/v1/responses", {
@@ -218,12 +401,12 @@ export async function analyzeOpportunityDocumentsWithOpenAI(
     throw new Error(error?.message || `OpenAI document analysis failed with HTTP ${response.status}.`);
   }
 
-  const outputText = typeof body?.output_text === "string" ? body.output_text : "";
-  if (!outputText) return fallback;
+  const outputText = extractResponsesText(body);
+  if (!outputText) return enrichDocumentAnalysis(fallback, documents);
 
   try {
-    return parseAnalysis(JSON.parse(outputText), fallback);
+    return enrichDocumentAnalysis(parseAnalysis(JSON.parse(outputText), fallback), documents);
   } catch {
-    return fallback;
+    return enrichDocumentAnalysis(fallback, documents);
   }
 }
